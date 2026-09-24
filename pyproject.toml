@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orca-bus"
+version = "0.1.0"
+description = "A message bus between terminal tabs (Claude Code, Codex, plain shells) managed by Orca"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+orca-bus = "orca_bus.cli:main"
+
+[tool.setuptools]
+packages = ["orca_bus"]

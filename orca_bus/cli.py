@@ -1,0 +1,153 @@
+"""orca-bus: one message bus for every terminal tab, whatever runs in it (Claude Code, Codex, a shell).
+
+  orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N]
+  orca-bus send <to> "<text>" [--from NAME] [--re ID]
+  orca-bus inbox [--unread] [--as NAME] [--json]
+  orca-bus ack <id> [--as NAME]
+  orca-bus who [--json]
+  orca-bus status [ID]
+  orca-bus deliver [--once] [--interval S] [--busy-grace S] [--max-attempts N]
+
+The bus directory is --dir, else $ORCA_BUS_DIR, else the nearest `.orca-bus/` above the current directory.
+Your own name is --from/--as, else $ORCA_BUS_NAME, else the registry entry for this terminal's
+$ORCA_TERMINAL_HANDLE.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+from .store import Bus, BusError
+
+
+def find_root(arg):
+    if arg:
+        return Path(arg)
+    if os.environ.get('ORCA_BUS_DIR'):
+        return Path(os.environ['ORCA_BUS_DIR'])
+    here = Path.cwd().resolve()
+    for d in [here, *here.parents]:
+        if (d / '.orca-bus').is_dir():
+            return d / '.orca-bus'
+    raise BusError('no bus directory: pass --dir, set ORCA_BUS_DIR, or create .orca-bus/ in the project root')
+
+
+def whoami(bus, explicit):
+    if explicit:
+        return explicit
+    if os.environ.get('ORCA_BUS_NAME'):
+        return os.environ['ORCA_BUS_NAME']
+    name = bus.name_for_handle(os.environ.get('ORCA_TERMINAL_HANDLE'))
+    if name:
+        return name
+    h = os.environ.get('ORCA_TERMINAL_HANDLE')
+    raise BusError('who are you? register this tab first (`register <name>`), or pass --from/--as'
+                   + (f' (this terminal is {h})' if h else ''))
+
+
+def live_terminals():
+    try:
+        from .orca import Orca
+        return Orca().terminals()
+    except Exception as ex:
+        print(f'(orca not reachable: {ex})', file=sys.stderr)
+        return None
+
+
+def out(obj, as_json, text):
+    print(json.dumps(obj, indent=1) if as_json else text)
+
+
+def main(argv=None, root=None, default_reply_cmd=None):
+    p = argparse.ArgumentParser(prog='orca-bus', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--dir', default=root)
+    sub = p.add_subparsers(dest='cmd', required=True)
+    r = sub.add_parser('register', help='map a stable name to this (or a given) terminal')
+    r.add_argument('name'); r.add_argument('--handle'); r.add_argument('--kind', choices=['claude', 'codex', 'shell'])
+    r.add_argument('--session'); r.add_argument('--note')
+    u = sub.add_parser('unregister'); u.add_argument('name')
+    s = sub.add_parser('send', help='send one line (<= max_len chars) to a registered name')
+    s.add_argument('to'); s.add_argument('text'); s.add_argument('--from', dest='frm'); s.add_argument('--re', dest='reply_to')
+    i = sub.add_parser('inbox'); i.add_argument('--unread', action='store_true'); i.add_argument('--as', dest='me')
+    i.add_argument('--json', action='store_true'); i.add_argument('--all', action='store_true', help='every message on the bus')
+    a = sub.add_parser('ack'); a.add_argument('ids', nargs='+'); a.add_argument('--as', dest='me')
+    w = sub.add_parser('who'); w.add_argument('--json', action='store_true')
+    st = sub.add_parser('status'); st.add_argument('id', nargs='?'); st.add_argument('--json', action='store_true')
+    d = sub.add_parser('deliver', help='run the delivery daemon (in its own plain terminal)')
+    d.add_argument('--once', action='store_true'); d.add_argument('--interval', type=float, default=5)
+    d.add_argument('--busy-grace', type=float, default=None,
+                   help='seconds to wait for idle before using the agent\'s own queue (default: wait for idle)')
+    d.add_argument('--max-attempts', type=int, default=5); d.add_argument('--settle', type=float, default=3.0)
+    args = p.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):  # titles carry spinner glyphs; a cp1252 console must not crash on them
+        try:
+            stream.reconfigure(errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
+    try:
+        bus = Bus(find_root(args.dir))
+        if default_reply_cmd and not (bus.root / 'config.json').exists():
+            (bus.root / 'config.json').write_text(json.dumps({'notify': [], 'reply_cmd': default_reply_cmd}, indent=1))
+
+        if args.cmd == 'register':
+            handle = args.handle or os.environ.get('ORCA_TERMINAL_HANDLE')
+            kind = args.kind
+            if not kind:
+                terms = live_terminals() or {}
+                agent = (terms.get(handle) or {}).get('agent')
+                kind = agent if agent in ('claude', 'codex') else 'shell'
+            old = bus.register(args.name, handle, kind, args.session, args.note)
+            moved = f' (was {old.get("handle")})' if old and old.get('handle') != handle else ''
+            print(f'registered {args.name} -> {handle} [{kind}]{moved}')
+        elif args.cmd == 'unregister':
+            print('removed' if bus.unregister(args.name) else 'not registered')
+        elif args.cmd == 'send':
+            frm = whoami(bus, args.frm)
+            m = bus.send(frm, args.to, args.text, args.reply_to)
+            print(f'queued {m["id"]} {frm} -> {args.to}')
+        elif args.cmd == 'inbox':
+            if args.all:
+                ms = sorted(bus.messages().values(), key=lambda m: m['time'])
+            else:
+                ms = bus.inbox(whoami(bus, args.me), args.unread)
+            out(ms, args.json, '\n'.join(f'{m["id"]} {m["time"][11:19]} {m["from"]}->{m["to"]} [{m["state"]}] {m["text"]}'
+                                          for m in ms) or '(empty)')
+        elif args.cmd == 'ack':
+            me = whoami(bus, args.me)
+            for mid in args.ids:
+                bus.ack(me, mid)
+            print(f'acked {len(args.ids)}')
+        elif args.cmd == 'who':
+            reg, terms = bus.registry(), live_terminals()
+            rows = []
+            for n, e in sorted(reg.items()):
+                live = None if terms is None else (e.get('handle') in terms if e.get('handle') else None)
+                title = (terms or {}).get(e.get('handle'), {}).get('title', '')
+                rows.append({'name': n, **e, 'live': live, 'title': title})
+            hb = bus.root / 'deliver.heartbeat'
+            age = time.time() - hb.stat().st_mtime if hb.exists() else None
+            daemon = 'daemon: ' + ('NOT RUNNING' if age is None or age > 60 else f'alive ({int(age)}s ago)')
+            out({'daemon_heartbeat_age_s': age, 'names': rows}, args.json, '\n'.join(
+                [daemon] + [f'{r["name"]:<16} {r["kind"]:<6} {"LIVE" if r["live"] else ("DEAD" if r["live"] is False else "?"):<4} '
+                            f'{(r["handle"] or "-")[:18]:<18} {r["title"][:40]}' for r in rows]))
+        elif args.cmd == 'status':
+            ms = bus.messages()
+            sel = [ms[args.id]] if args.id else sorted(ms.values(), key=lambda m: m['time'])[-20:]
+            out(sel, args.json, '\n'.join(f'{m["id"]} {m["from"]}->{m["to"]} {m["state"]} '
+                                          f'({m["history"][-1][2]}) {m["text"][:60]}' for m in sel))
+        elif args.cmd == 'deliver':
+            from .deliver import run
+            from .orca import Orca
+            run(bus, Orca(), interval=args.interval, once=args.once, busy_grace=args.busy_grace,
+                max_attempts=args.max_attempts, settle=args.settle)
+    except BusError as ex:
+        print(f'orca-bus: {ex}', file=sys.stderr)
+        return 2
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
