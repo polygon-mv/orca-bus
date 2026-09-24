@@ -15,8 +15,11 @@ Rules every typed delivery follows (brief: two writers garbled one input box):
   - EMPTY BEFORE, INTACT AFTER. The input box must be empty before typing; after typing, it must hold exactly our
     text (and the agent must still be idle) before Enter is pressed. If it does not, our text is taken back out
     when that can be done without touching anyone else's, and Enter is never pressed on a mix.
-  - DON'T TRUST A BROKEN SCREEN. If the screen does not have the input box's shape (Orca's copy of the screen is
-    a different size from the pane), nothing read from it counts as evidence.
+  - A STALE SCREEN COPY IS NOT A BLOCKER. Orca's copy of a restored, hidden tab's screen can stay at 80x24 while the
+    pane is wider; its rows are then garbage and its `draft` reports the ghost suggestion plus footer pieces as typed
+    text. Such a Claude tab is delivered to "blind": idle/busy from the tab title (not the screen), the text typed,
+    then kept only if the input row now STARTS with it (typing replaces the suggestion; anything already in the box
+    would come first), and proof from Claude's transcript. Proof from the transcript is used for every Claude tab.
   - SAY SO, DON'T WAIT SILENTLY. When a tab's input box holds text the bus did not write, or its screen cannot be
     read, for `alert_after` seconds, the recipient's owner, the `notify` names and the waiting senders are told once,
     with the reason and the remedy. The message itself fails after `draft_grace`.
@@ -26,7 +29,7 @@ import json
 import os
 import time
 
-from . import tui
+from . import transcript, tui
 from .store import OPEN_STATES
 
 DEL = '\x7f'  # what Backspace sends in Claude Code and Codex
@@ -37,14 +40,14 @@ REMEDY = {
     'mixed': 'The box holds bus text mixed with other text and Enter was NOT pressed. Clear the input box in that tab '
              '(Esc or Ctrl+U) or have its owner do it; the bus retries on its own afterwards.',
     'desync': "Orca's copy of that tab's screen is out of sync with the pane (it starts at 80x24 when a tab is "
-              "restored before its size is known), so nobody can read its input box. Resize that pane once (drag a "
-              "divider, or maximise and restore the window). No typing is needed.",
+              "restored before its size is known) and its title shows neither idle nor busy, so the bus cannot tell "
+              "when to type. Showing the tab and resizing its pane once fixes the copy; no typing is needed.",
 }
 
 
 class Deliverer:
     def __init__(self, bus, orca, busy_grace=None, draft_grace=1800, alert_after=120, max_attempts=5, backoff=15,
-                 settle=3.0, poll=10, holder='daemon', sleep=time.sleep, clock=time.time, log=None):
+                 settle=3.0, poll=10, holder='daemon', sleep=time.sleep, clock=time.time, log=None, has_prompt=None):
         self.bus, self.orca = bus, orca
         self.busy_grace = busy_grace  # kept for old command lines; a busy agent is never typed into any more
         self.draft_grace, self.alert_after = draft_grace, alert_after
@@ -53,6 +56,8 @@ class Deliverer:
         self.sleep, self.clock = sleep, clock
         self.log = log or (lambda s: None)
         self.stuck = {}  # recipient -> {'cls', 'since', 'alerted'}: one alert per blocked episode
+        # has_prompt(token, since): did a Claude session receive this prompt? (its transcript; tests inject a fake)
+        self.has_prompt = has_prompt or transcript.claude_has_prompt
 
     # ------------------------------------------------------------------ formatting
     def format(self, m):
@@ -139,7 +144,13 @@ class Deliverer:
         return self.later(m, why, since)
 
     # ------------------------------------------------------------------ the typed delivery
-    def proven(self, handle, kind, token):
+    def proven(self, handle, kind, token, since=0, screen_ok=True):
+        """(delivered?, composer text). Claude: its transcript is the proof that holds whatever the screen shows.
+        The screen counts only when it is a trustworthy frame and the box no longer holds our text."""
+        if kind == 'claude' and self.has_prompt(token, since):
+            return True, ''
+        if not screen_ok:
+            return False, ''
         lines, draft = self.orca.screen(handle)
         comp = tui.composer_text(kind, lines, draft)
         if token in comp:
@@ -165,22 +176,24 @@ class Deliverer:
 
     def _deliver_locked(self, m, handle, kind, title, since):
         token, text = m['id'], self.format(m)
-        ok, comp = self.proven(handle, kind, token)
-        if ok:  # already there (a previous attempt worked but the daemon died before recording it)
-            return self.done(m, 'found in terminal output')
         lines, draft = self.orca.screen(handle)
+        good, why = tui.frame_ok(kind, lines)
+        ok, comp = self.proven(handle, kind, token, self.sent_at(m), good)
+        if ok:  # already there (a previous attempt worked but the daemon died before recording it)
+            return self.done(m, 'found in the transcript or terminal output')
+        if kind == 'claude' and not good and tui.title_state(title) is not None:
+            return self._deliver_blind(m, handle, title, since, why)
         if not tui.is_ready(kind, lines):
             if kind == 'claude' and self.clock() - since > self.alert_after:
                 return self.blocked(m, 'desync', 'no input box on the screen', since)
             return self.later(m, 'TUI still booting', since)
-        good, why = tui.frame_ok(kind, lines)
         if not good:
             return self.blocked(m, 'desync', why, since)
         comp = tui.composer_text(kind, lines, draft)
         ours = token in comp
         if comp and not ours:
             return self.blocked(m, 'foreign', f'input box holds text the bus did not write: {comp[:60]!r}', since)
-        if ours and not tui.same_text(comp, text):
+        if ours and not tui.intact(comp, text):
             return self.blocked(m, 'mixed', f'input box holds {token} mixed with other text: {comp[:60]!r}', since,
                                 now_alert=True)
         if tui.is_busy(kind, lines, title):
@@ -196,28 +209,68 @@ class Deliverer:
             lines, draft = self.orca.screen(handle)
             comp = tui.composer_text(kind, lines, draft)
             if tui.is_busy(kind, lines, self.orca.terminals().get(handle, {}).get('title', '')):
-                if tui.same_text(comp, text):
+                if tui.intact(comp, text):
                     self.undo(handle, text)
                     return self.later(m, 'recipient became busy while the text was typed: took it back out', since)
                 return self.blocked(m, 'mixed', f'recipient became busy and the box holds {comp[:60]!r}', since,
                                     now_alert=True)
-            if not tui.same_text(comp, text):
-                if ' '.join(comp.split()).endswith(' '.join(text.split())) and token in comp:
+            if not tui.intact(comp, text):
+                if tui._squash(comp).endswith(tui._squash(text)) and token in comp:
                     self.undo(handle, text)  # someone else's text came first: remove ours, leave theirs untouched
                     return self.blocked(m, 'foreign', 'someone else typed into the box at the same moment: '
                                                       'took our text back out', since)
                 if token not in comp:
                     return self.retry(m, 'the typed text did not appear in the input box')
                 return self.blocked(m, 'mixed', f'typed text did not land intact: {comp[:60]!r}', since, now_alert=True)
+        t0 = self.clock()
         for i in range(3):  # Codex swallows an Enter now and then: re-send CR while the text is still a draft
             self.orca.send(handle, '\r')
             self.sleep(self.settle)
-            ok, comp = self.proven(handle, kind, token)
+            ok, comp = self.proven(handle, kind, token, t0)
             if ok:
                 return self.done(m, 'submitted' + (f' after {i + 1} keys' if i else ''))
             if token not in comp:
                 break
         return self.retry(m, 'no proof of submission' + (' (text still in the input box)' if token in comp else ''))
+
+    def _deliver_blind(self, m, handle, title, since, why):
+        """Claude tab whose screen copy cannot be read (see the module docstring)."""
+        token, text = m['id'], self.format(m)
+        if tui.title_state(title) == 'busy':
+            self.stuck.pop(m['to'], None)
+            return self.later(m, f'recipient busy: waiting for its next idle ({why}; reading the title)', since)
+        t0 = self.clock()
+        if not self.orca.send(handle, text):
+            return self.retry(m, 'orca did not accept the text')
+        self.sleep(0.8)
+        lines, draft = self.orca.screen(handle)
+        landed = tui.input_row_starts_with(lines, draft, f'[bus {token} from ')
+        if tui.title_state(self.orca.terminals().get(handle, {}).get('title', '')) != 'idle':
+            self.undo(handle, text)
+            return self.later(m, 'recipient became busy while the text was typed: took it back out', since)
+        if not landed:  # the box held something else, or the keys went to a dialog: ours is last, take it back
+            self.log(f'BLIND {token} -> {m["to"]}: not at the start of an input row; prompt rows '
+                     f'{[r[:40] for r in tui.prompt_rows(lines)][-3:]!r}, draft {(draft or "")[:40]!r}')
+            self.undo(handle, text)
+            return self.blocked(m, 'foreign', f'{why}, and the typed text did not start the input row (it held other '
+                                              f'text, or a dialog was open): took it back out', since)
+        for i in range(3):
+            self.orca.send(handle, '\r')
+            self.sleep(self.settle)
+            if self.has_prompt(token, t0):
+                return self.done(m, f'submitted blind ({why}); proof: transcript' + (f' after {i + 1} keys' if i else ''))
+            if tui.title_state(self.orca.terminals().get(handle, {}).get('title', '')) == 'busy':
+                break  # the turn started: Enter was taken, the transcript line follows
+        self.sleep(self.settle)
+        if self.has_prompt(token, t0):
+            return self.done(m, f'submitted blind ({why}); proof: transcript')
+        return self.retry(m, f'no proof of submission (blind: {why})')
+
+    def sent_at(self, m):
+        try:
+            return datetime.datetime.fromisoformat(m['time']).timestamp()
+        except (KeyError, ValueError):
+            return 0
 
     def undo(self, handle, text):
         """Delete our own text from the end of the input box (only ever called when the box ends with exactly it)."""

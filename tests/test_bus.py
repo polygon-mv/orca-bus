@@ -29,7 +29,7 @@ class Clock:
 def make(tmp, **kw):
     bus = Bus(tmp)
     orca, clock = FakeOrca(), Clock()
-    d = Deliverer(bus, orca, sleep=clock.sleep, clock=clock, **kw)
+    d = Deliverer(bus, orca, sleep=clock.sleep, clock=clock, has_prompt=orca.transcript_has, **kw)
     return bus, orca, clock, d
 
 
@@ -95,6 +95,7 @@ class StoreTests(unittest.TestCase):
         [t.start() for t in ts]
         [t.join() for t in ts]
         self.assertEqual(len(self.bus.messages()), 100)
+        self.assertEqual(len({m['id'] for m in self.bus.messages().values()}), 100)
 
     def test_typing_lock_is_exclusive_and_a_stale_one_is_broken(self):
         with self.bus.typing_lock('c', 'one') as a:
@@ -250,7 +251,8 @@ class DeliverTests(unittest.TestCase):
         orca.send = lambda h, x: (_t.sleep(0.05), slow(h, x))[1]
         bus.register('c', 'term_c', 'claude')
         ids = [bus.send('me', 'c', f'n{i}')['id'] for i in range(2)]
-        ds = [Deliverer(bus, orca, settle=0.05, poll=0, backoff=0, holder=f'w{i}') for i in range(2)]
+        ds = [Deliverer(bus, orca, settle=0.05, poll=0, backoff=0, holder=f'w{i}', has_prompt=orca.transcript_has)
+              for i in range(2)]
         for _ in range(6):
             th = [threading.Thread(target=d.tick) for d in ds]
             [x.start() for x in th]
@@ -324,22 +326,77 @@ class DeliverTests(unittest.TestCase):
             d.tick()
         self.assertEqual(bus.messages()[m1['id']]['state'], 'failed')
 
-    def test_out_of_sync_screen_alerts_with_the_remedy_then_delivers_when_fixed(self):
+    def test_out_of_sync_screen_idle_tab_is_delivered_blind(self):
+        # the incident: a restored tab's screen copy stayed 80x24; its title still says idle, and that is enough
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude', desync=True))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        r = run_until_settled(d, clock, bus, m['id'])
+        self.assertEqual(r['state'], 'delivered')
+        self.assertIn('proof: transcript', r['history'][-1][2])
+        self.assertEqual(len(t.history), 1)
+        self.assertTrue(t.history[0].startswith(f'[bus {m["id"]} from me] hi'))
+
+    def test_out_of_sync_screen_with_text_in_the_box_takes_ours_back(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude', desync=True, composer='half a thought '))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        d.tick()
+        self.assertEqual(t.composer, 'half a thought ')  # the typed text did not start the row: removed, no Enter
+        self.assertNotIn('\r', t.keys)
+        self.assertEqual(t.history, [])
+        self.assertEqual(bus.messages()[m['id']]['state'], 'queued')
+
+    def test_out_of_sync_screen_busy_title_is_not_typed_into(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude', desync=True, busy=True))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        for _ in range(5):
+            d.tick(); clock.t += 20
+        self.assertEqual(t.keys, [])
+        t.busy = False
+        self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
+
+    def test_out_of_sync_screen_and_no_title_alerts_with_the_remedy(self):
         bus, orca, clock, d = make(self.tmp, alert_after=120)
         (Path(self.tmp) / 'config.json').write_text(json.dumps({'notify': ['boss']}))
         bus.register('boss', None, 'shell')
-        t = orca.add('term_c', FakeTerm('claude', desync=True))
+        t = orca.add('term_c', FakeTerm('claude', desync=True), title='plain')
         bus.register('c', 'term_c', 'claude')
-        m = bus.send('boss', 'c', 'hi')
+        bus.send('boss', 'c', 'hi')
         for _ in range(10):
             d.tick(); clock.t += 20
         self.assertEqual(t.keys, [])
         notes = [x for x in bus.messages().values() if x['from'] == 'bus']
         self.assertEqual(len(notes), 1)
-        self.assertIn('Resize that pane', notes[0]['text'])
-        t.desync = False  # someone resized the pane
+        self.assertIn('out of sync', notes[0]['text'])
+
+    def test_long_text_in_a_narrow_pane_is_recognised_by_its_visible_tail(self):
+        # live 2026-09-24: a 600-char message in a 51-column pane; Orca's draft held only the last 13 lines, the
+        # daemon called it "not intact", did not press Enter, and left it in the box
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude', box_chars=300))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'x ' * 280)
         self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
-        self.assertNotIn('c', d.stuck)
+        self.assertEqual(len(t.history), 1)
+
+    def test_own_text_left_in_the_box_is_submitted_by_the_next_attempt(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude', box_chars=300))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'y ' * 280)
+        t.composer = d.format(m)  # typed by an earlier attempt that did not press Enter
+        self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
+        self.assertEqual(t.history, [d.format(m)])
+        self.assertNotIn(d.format(m), t.keys)  # not typed a second time
+
+    def test_stale_copy_draws_spaces_as_the_rule_underneath(self):
+        self.assertTrue(tui.input_row_starts_with([], '[bus─m1─from─a]─hello─th', '[bus m1 from '))
+        self.assertFalse(tui.input_row_starts_with(['❯ hello [bus m1 from x]'], None, '[bus m1 from '))
 
     def test_booting_tab_waits(self):
         bus, orca, clock, d = make(self.tmp)
@@ -409,6 +466,26 @@ class DeliverTests(unittest.TestCase):
         d.tick()
         self.assertEqual(bus.messages()[m['id']]['state'], 'inbox')
         self.assertEqual(t.keys, [])
+
+
+class TranscriptTests(unittest.TestCase):
+    def test_only_a_submitted_prompt_counts(self):
+        import time as _t
+        from orca_bus.transcript import claude_has_prompt
+        root = Path(tempfile.mkdtemp())
+        (root / 'E--proj').mkdir()
+        f = root / 'E--proj' / 's1.jsonl'
+        # the sender's own transcript shows the id in tool output; that is not a delivery
+        f.write_text(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': [
+            {'type': 'tool_result', 'content': 'queued m1 a -> b; [bus m1 from a] hi'}]}}, separators=(',', ':')) + '\n')
+        self.assertFalse(claude_has_prompt('m1', _t.time() - 60, root))
+        with open(f, 'a') as fh:
+            fh.write(json.dumps({'type': 'user', 'message': {'role': 'user', 'content': '[bus m1 from a] hi || reply'}},
+                                separators=(',', ':')) + '\n')
+        self.assertTrue(claude_has_prompt('m1', _t.time() - 60, root))
+        self.assertFalse(claude_has_prompt('m2', _t.time() - 60, root))
+        os.utime(f, (0, 0))  # only transcripts written since the attempt are read
+        self.assertFalse(claude_has_prompt('m1', _t.time() - 60, root))
 
 
 class CliTests(unittest.TestCase):

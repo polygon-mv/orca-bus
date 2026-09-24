@@ -57,7 +57,7 @@ Choose a bus directory shared by all tabs: `--dir`, or `ORCA_BUS_DIR`, or a `.or
 { "notify": ["coordinator"], "reply_cmd": "orca-bus", "max_len": 600 }
 ```
 
-`notify` names are told about every failed delivery (the sender always is). `reply_cmd` is what the delivered text
+`notify` names are told about every failed delivery (the sender always is) and about every blocked tab. `reply_cmd` is what the delivered text
 tells the recipient to run to reply. A project wrapper script can put its own command there.
 
 ## CLI
@@ -112,7 +112,9 @@ Messages to one recipient go strictly in order. For each open message:
 | handle not in `orca terminal list` | `failed`: "tab closed", sender and `notify` names told |
 | another writer holds the tab's typing lock | wait (never two writers in one input box) |
 | TUI still booting | wait |
-| screen does not show the input box's shape | wait; **alert** after `--alert-after`; `failed` after `--draft-grace` |
+| Claude screen copy out of sync (see below), title says idle | delivered **blind**: type, keep it only if an input row now starts with `[bus <id> from`, Enter, proof from the transcript |
+| Claude screen copy out of sync, title says busy | wait for its next idle |
+| screen copy out of sync and the title says neither | wait; **alert** after `--alert-after`; `failed` after `--draft-grace` |
 | input box holds text the bus did not write | wait, never typed over; **alert** after `--alert-after`; `failed` after `--draft-grace` |
 | agent busy | wait for its next idle, however long; **nothing is typed into a busy agent** |
 | idle and empty | type the text; check the agent is still idle and the box holds exactly that text; only then send CR as a separate write; up to 3 CRs while the text is still in the box |
@@ -123,9 +125,11 @@ Messages to one recipient go strictly in order. For each open message:
 mistake) first takes `<bus>/locks/<name>.lock` and holds it from the first screen read to the proof of submission. A
 lock left by a killed writer is broken after 2 minutes.
 
-**Proof of delivery** means the composer no longer holds the text and the message id appears in the terminal output.
-Before every attempt the daemon checks whether the id is already on screen, so a daemon that died mid-delivery never
-sends a duplicate.
+**Proof of delivery.** For Claude Code: the prompt `[bus <id> from ...` appears as a `user` entry in a session
+transcript (`~/.claude/projects/*/*.jsonl`; set `CLAUDE_CONFIG_DIR` or `ORCA_BUS_CLAUDE_PROJECTS` if yours is
+elsewhere). Nothing else writes that prefix: a sender's own transcript shows the id only inside tool output, which
+is not counted. Otherwise, and for Codex: the composer no longer holds the text and the id appears in the terminal
+output. Before every attempt the daemon checks both, so a daemon that died mid-delivery never sends a duplicate.
 
 **Alerts.** When a tab cannot take messages for a reason only a person can fix (text in its box that the bus did
 not write, or a screen that cannot be read), the daemon waits `--alert-after` seconds (a person may be mid-sentence)
@@ -156,10 +160,18 @@ after that many seconds. That leaves text in the box whenever the queue does not
   garbage: words at column 0 and stray letters at column 79, and a prompt row where the ghost suggestion is mixed
   with pieces of the footer (`...tonighthell, 1 mon  or st ll  unning`). Orca's `draft` is derived from that same
   copy and reports the mix as typed text. The daemon only trusts a Claude screen that has the input box's shape
-  (two rules of the same width around the prompt). Otherwise it waits and alerts with the fix: show the tab and
-  resize its pane once (drag a divider, or maximise and restore the window). No typing is needed.
-- **Long drafts come back soft-wrapped**: Orca's `draft` has a newline where the pane wrapped a space. The
-  "landed intact" check compares modulo whitespace.
+  (two rules of the same width around the prompt). Any hidden tab can be in this state, so the daemon does not
+  depend on the copy there. It delivers **blind**. Idle and busy come from the tab title, which Claude sets itself
+  (U+2733 idle, a spinner glyph busy), not from the copy. It types the text and keeps it only if an input row now
+  *starts* with `[bus <id> from`. That id exists nowhere before this send, and anything already in the box would come
+  before it. Otherwise it takes its own text back out with Backspace. Proof comes from Claude's transcript. On the
+  stale copy the spaces Claude skips over show the rule row underneath (`[bus─m0924...─from─x]`), and the check
+  allows for that. Showing the tab and resizing its pane once fixes the copy itself.
+- **Long drafts come back soft-wrapped**: Orca's `draft` has a newline where the pane wrapped (at a space, or inside
+  a long word). The "landed intact" check compares with all whitespace removed.
+- **Claude's input box scrolls.** In a narrow pane a long text fills more lines than the box shows, and Orca's `draft`
+  then holds only the visible last lines. Our text ends with its own id (in the reply hint), so a draft that is
+  the tail of our text is accepted as ours.
 - **Text typed into a busy Claude** is kept as a draft through the turn and is still there afterwards, unsent.
 
 ## Files

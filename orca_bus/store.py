@@ -226,7 +226,9 @@ class Bus:
     def send(self, frm, to, text, reply_to=None):
         check_name(to)
         text = clean_text(text, self.config()['max_len'])
-        mid = f"m{datetime.datetime.now():%m%d%H%M%S}{secrets.token_hex(2)}"
+        # 8 random hex digits: with 4, two sends in the same second collided often enough to merge two messages
+        # into one in the fold (7% of the 100-sends-in-a-second test runs)
+        mid = f"m{datetime.datetime.now():%m%d%H%M%S}{secrets.token_hex(4)}"
         msg = {'ev': 'msg', 'id': mid, 'from': frm, 'to': to, 'time': now_iso(), 'text': text,
                'state': 'queued', 'reply_to': reply_to}
         with self.lock():

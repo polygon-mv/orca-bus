@@ -102,9 +102,57 @@ def frame_ok(kind, lines):
     return True, ''
 
 
+def title_state(title):
+    """'idle' / 'busy' / None from the Orca tab title alone. The title comes from the terminal's own title sequence,
+    not from Orca's screen copy, so it stays right when that copy is the wrong size."""
+    t = (title or '').strip()[:1]
+    if t == IDLE_TITLE:
+        return 'idle'
+    if t in SPINNER_TITLE:
+        return 'busy'
+    return None
+
+
+def prompt_rows(lines):
+    """The text after each prompt glyph, top to bottom."""
+    return [l.lstrip()[1:].lstrip() for l in lines if l.lstrip().startswith('❯')]
+
+
+def input_row_starts_with(lines, draft, prefix):
+    """Some prompt row (or the draft) begins with `prefix`. Used on a stale screen copy after typing: the prefix
+    carries the message id, which exists nowhere before this send, so only the live input row can show it, and it
+    starts that row only if the box held nothing before it."""
+    # on a stale copy, spaces Claude skips over show the rule row underneath: '[bus─m0924...─from─x]'
+    want = _squash(prefix)
+    return any(_squash(r.replace('─', ' ')).startswith(want) for r in prompt_rows(lines) + [draft or ''])
+
+
+def starts_with(have, text, n=60):
+    """`have` begins with the first n characters of `text` (modulo whitespace; a stale 80-column copy of a wider
+    pane still shows the start of the input row intact)."""
+    want = ' '.join(text.split())[:n]
+    return ' '.join((have or '').split()).startswith(want)
+
+
+def _squash(s):
+    return ''.join((s or '').split())
+
+
 def same_text(a, b):
-    """Orca soft-wraps a long draft at the pane width (a newline where a space was): compare modulo whitespace."""
-    return ' '.join((a or '').split()) == ' '.join((b or '').split())
+    """Orca soft-wraps a long draft at the pane width (a newline where a space was, or inside a long word):
+    compare without whitespace."""
+    return _squash(a) == _squash(b)
+
+
+def is_tail_of(comp, text):
+    """Claude's input box scrolls: for a long text in a narrow pane Orca's `draft` holds only the visible last lines.
+    Our text ends with its own id (the reply hint), so a visible tail still identifies it."""
+    c, t = _squash(comp), _squash(text)
+    return len(c) >= min(len(t), 40) and t.endswith(c)
+
+
+def intact(comp, text):
+    return same_text(comp, text) or is_tail_of(comp, text)
 
 
 def queue_hint(lines):

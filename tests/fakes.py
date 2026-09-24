@@ -4,12 +4,14 @@ RULE = '─' * 40
 
 
 class FakeTerm:
-    def __init__(self, kind, busy=False, swallow=0, booting=False, composer='', report_draft=True, desync=False):
+    def __init__(self, kind, busy=False, swallow=0, booting=False, composer='', report_draft=True, desync=False,
+                 box_chars=None):
         self.kind, self.busy, self.swallow, self.booting = kind, busy, swallow, booting
         self.composer, self.history, self.queued = composer, [], []
         self.report_draft = report_draft
         self.desync = desync        # Orca's screen copy is 80x24 while the pane is wider: the frame is garbage
         self.on_type = None         # hook(term, text) run after a text write: another writer, a turn starting
+        self.box_chars = box_chars  # Claude's input box scrolls: Orca's draft is only its last visible lines
         self.keys = []
 
     def type(self, text):
@@ -42,9 +44,11 @@ class FakeTerm:
         if self.kind == 'claude':
             if self.booting:
                 return ['Claude Code starting']
-            if self.desync:  # captured shape: words at column 0, a stray char at column 79, no rules
-                return ['ow' + ' ' * 77 + 'm', 'emory,' + ' ' * 73 + 'C', 'ead.' + ' ' * 75 + 'O',
-                        '❯\xa0run the tests tonighthell, 1 mon  or st ll  unning']
+            if self.desync:  # captured shape: words at column 0, a stray char at column 79, no rules; the
+                # input row still STARTS with what is in the box (the ghost suggestion when it is empty)
+                hist = [f'❯ {h[:78]}' for h in self.history]
+                return hist + ['ow' + ' ' * 77 + 'm', 'emory,' + ' ' * 73 + 'C', 'ead.' + ' ' * 75 + 'O',
+                               '❯\xa0' + (self.composer or 'run the tests tonight')[:60] + 'hell, 1 mon  or st ll  unning']
             out = [f'❯ {h}' for h in self.history]
             out += [f'  queued: {q}' for q in self.queued]
             if self.busy:
@@ -69,14 +73,22 @@ class FakeOrca:
         return term
 
     def terminals(self):
-        return {h: {'title': ('◐ work' if t.busy and t.kind == 'claude' else title), 'agent': t.kind, 'cwd': '.'}
-                for h, (t, title) in self.terms.items()}
+        def title_of(t, title):
+            if t.kind != 'claude' or title == 'plain':
+                return '' if title == 'plain' else title
+            return '◐ work' if t.busy else (title or '✳ Claude Code')
+        return {h: {'title': title_of(t, title), 'agent': t.kind, 'cwd': '.'} for h, (t, title) in self.terms.items()}
+
+    def transcript_has(self, token, since=0):
+        """What Claude writes to its session transcript: every prompt that was submitted."""
+        return any(token in h for t, _ in self.terms.values() if t.kind == 'claude' for h in t.history)
 
     def screen(self, handle):
         t = self.terms[handle][0]
         if t.desync:  # Orca derives `draft` from the same broken frame
-            return t.lines(), 'run the tests tonighthell, 1 mon  or st ll  unning'
-        return t.lines(), (t.composer or None) if t.report_draft else None
+            return t.lines(), t.lines()[-1][2:]
+        draft = t.composer[-t.box_chars:] if t.box_chars else t.composer
+        return t.lines(), (draft or None) if t.report_draft else None
 
     def scrollback(self, handle, limit=400):
         return self.terms[handle][0].lines()
