@@ -124,6 +124,8 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(tui.composer_text('claude', empty, 'Show test results'), '')
         self.assertEqual(tui.composer_text('claude', typed, 'abc'), 'abc')
         self.assertEqual(tui.composer_text('codex', empty, 'abc'), 'abc')
+        narrow = empty[:-1] + ['  ⏵⏵ bypass permissions on (shift+tab to cycle) ·']  # hint cut off
+        self.assertEqual(tui.composer_text('claude', narrow, 'check tab status'), '')
 
     def test_codex_screens(self):
         idle = ['model: gpt   /model to change', '  › Ask Codex to do anything   model default']

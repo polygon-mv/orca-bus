@@ -52,7 +52,9 @@ CLAUDE_EMPTY_HINT = re.compile(os.environ.get('ORCA_BUS_CLAUDE_EMPTY_HINT', '←
 
 
 def claude_input_empty(lines):
-    return any(CLAUDE_EMPTY_HINT.search(l) for l in [l for l in lines if l.strip()][-2:])
+    footer = [l for l in lines if l.strip()][-2:]
+    # in a narrow pane the hint is cut off and the footer ends in its leading separator: "... (shift+tab to cycle) ·"
+    return any(CLAUDE_EMPTY_HINT.search(l) or l.rstrip().endswith('·') for l in footer)
 
 
 def composer_text(kind, lines, draft=None):
