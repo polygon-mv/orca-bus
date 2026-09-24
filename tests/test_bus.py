@@ -96,6 +96,26 @@ class StoreTests(unittest.TestCase):
         [t.join() for t in ts]
         self.assertEqual(len(self.bus.messages()), 100)
 
+    def test_typing_lock_is_exclusive_and_a_stale_one_is_broken(self):
+        with self.bus.typing_lock('c', 'one') as a:
+            with self.bus.typing_lock('c', 'two') as b:
+                self.assertTrue(a)
+                self.assertFalse(b)
+            self.assertEqual(self.bus.typing_lock_holder('c')['holder'], 'one')
+        self.assertIsNone(self.bus.typing_lock_holder('c'))
+        p = self.bus.typing_lock_path('c')
+        p.write_text('{}')
+        os.utime(p, (0, 0))  # a writer died holding it
+        with self.bus.typing_lock('c', 'three', stale=120) as got:
+            self.assertFalse(got)  # this try breaks it...
+        with self.bus.typing_lock('c', 'three', stale=120) as got:
+            self.assertTrue(got)  # ...and the next one takes it
+
+    def test_owner_survives_a_re_register(self):
+        self.bus.register('w', 'term_1', 'claude', owner='lead')
+        self.bus.register('w', 'term_2', 'claude')
+        self.assertEqual(self.bus.registry()['w']['owner'], 'lead')
+
     def test_torn_log_line_is_skipped(self):
         self.bus.register('t', None, 'shell')
         self.bus.send('a', 't', 'one')
@@ -126,6 +146,26 @@ class TuiTests(unittest.TestCase):
         self.assertEqual(tui.composer_text('codex', empty, 'abc'), 'abc')
         narrow = empty[:-1] + ['  ⏵⏵ bypass permissions on (shift+tab to cycle) ·']  # hint cut off
         self.assertEqual(tui.composer_text('claude', narrow, 'check tab status'), '')
+
+    def test_claude_frame_out_of_sync(self):
+        # captured 2026-09-24 (text replaced): Orca's copy of a restored tab's screen stayed 80x24 while the pane was
+        # 128 wide. The prompt row mixes Claude's ghost suggestion with pieces of the footer "1 shell, 1 monitor still
+        # running", Orca reported that as `draft`, and the bus waited 30 min for a person to clear a box nobody typed in.
+        desync = ['ow' + ' ' * 77 + 'm', 'emory,' + ' ' * 73 + 'C', 'ead.' + ' ' * 75 + 'O',
+                  '❯\xa0run the tests tonighthell, 1 mon  or st ll  unning']
+        ok, why = tui.claude_frame(desync)
+        self.assertFalse(ok)
+        self.assertIn('out of sync', why)
+        rule = '─' * 128
+        good = ['● done', rule, '❯', rule, '  ⏵⏵ bypass permissions on · ← for agents']
+        self.assertEqual(tui.claude_frame(good), (True, ''))
+        self.assertFalse(tui.claude_frame(['● done', '─' * 128, '❯', '─' * 80, 'footer'])[0])
+        self.assertEqual(tui.frame_ok('codex', desync), (True, ''))
+
+    def test_same_text_ignores_soft_wrap(self):
+        # captured: a long draft comes back from Orca wrapped at the pane width, a newline where a space was
+        self.assertTrue(tui.same_text('a b c d', 'a b\nc d'))
+        self.assertFalse(tui.same_text('a b c d', 'a b c d e'))
 
     def test_codex_screens(self):
         idle = ['model: gpt   /model to change', '  › Ask Codex to do anything   model default']
@@ -172,15 +212,134 @@ class DeliverTests(unittest.TestCase):
         t.busy = False
         self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
 
-    def test_busy_grace_uses_native_queue(self):
+    def test_busy_is_never_typed_into_even_with_busy_grace(self):
+        # typing mid-turn leaves the text as a draft in the box: the next writer then sees "someone else's text"
         bus, orca, clock, d = make(self.tmp, busy_grace=60)
-        t = orca.add('term_x', FakeTerm('codex', busy=True))
-        bus.register('x', 'term_x', 'codex')
+        t = orca.add('term_x', FakeTerm('claude', busy=True))
+        bus.register('x', 'term_x', 'claude')
         m = bus.send('me', 'x', 'queue me')
-        r = run_until_settled(d, clock, bus, m['id'])
-        self.assertEqual(r['state'], 'delivered')
-        self.assertIn('queued', r['history'][-1][2])
-        self.assertIn('\t', t.keys)  # Codex queues with Tab, not Enter
+        for _ in range(20):
+            d.tick(); clock.t += 20
+        self.assertEqual(t.keys, [])
+        self.assertEqual(bus.messages()[m['id']]['state'], 'queued')
+
+    def test_typing_lock_holder_blocks_every_other_writer(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude'))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hello')
+        with bus.typing_lock('c', 'send --now by x') as got:
+            self.assertTrue(got)
+            d.tick()
+            self.assertEqual(t.keys, [])
+            r = bus.messages()[m['id']]
+            self.assertEqual(r['state'], 'queued')
+            self.assertIn('another sender is typing', r['history'][-1][2])
+        clock.t += 20
+        self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
+        self.assertFalse(bus.typing_lock_path('c').exists())
+
+    def test_two_concurrent_writers_never_share_one_prompt(self):
+        # reproduced live: two unlocked writers into one idle Claude tab -> the second text is appended to the
+        # first and ONE Enter submits both as one prompt. With the lock each prompt holds exactly one message.
+        import time as _t
+        bus = Bus(self.tmp)
+        orca = FakeOrca()
+        t = orca.add('term_c', FakeTerm('claude'))
+        slow = orca.send
+        orca.send = lambda h, x: (_t.sleep(0.05), slow(h, x))[1]
+        bus.register('c', 'term_c', 'claude')
+        ids = [bus.send('me', 'c', f'n{i}')['id'] for i in range(2)]
+        ds = [Deliverer(bus, orca, settle=0.05, poll=0, backoff=0, holder=f'w{i}') for i in range(2)]
+        for _ in range(6):
+            th = [threading.Thread(target=d.tick) for d in ds]
+            [x.start() for x in th]
+            [x.join() for x in th]
+        self.assertEqual([h.count('[bus ') for h in t.history], [1, 1])
+        self.assertEqual([h.split()[1] for h in t.history], ids)
+
+    def test_turn_starts_while_typing_text_is_taken_back(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude'))
+        t.on_type = lambda term, text: setattr(term, 'busy', True)  # a background task woke the agent just then
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        d.tick()
+        self.assertEqual(t.composer, '')
+        self.assertNotIn('\r', t.keys)
+        self.assertEqual(bus.messages()[m['id']]['state'], 'queued')
+        t.busy = False
+        clock.t += 20
+        self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
+        self.assertEqual(len(t.history), 1)
+
+    def test_someone_typing_at_the_same_moment_keeps_their_text(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude'))
+        t.on_type = lambda term, text: setattr(term, 'composer', 'my own words ' + term.composer)
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        d.tick()
+        self.assertEqual(t.composer, 'my own words ')  # ours taken back out, theirs untouched, no Enter
+        self.assertNotIn('\r', t.keys)
+        self.assertEqual(bus.messages()[m['id']]['state'], 'queued')
+
+    def test_mixed_text_is_never_submitted_and_alerts_at_once(self):
+        bus, orca, clock, d = make(self.tmp)
+        (Path(self.tmp) / 'config.json').write_text(json.dumps({'notify': ['boss']}))
+        bus.register('boss', None, 'shell')
+        bus.register('me', None, 'shell')
+        t = orca.add('term_c', FakeTerm('claude'))
+        t.on_type = lambda term, text: setattr(term, 'composer', term.composer[:20] + 'XX' + term.composer[20:])
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('me', 'c', 'hi')
+        d.tick()
+        self.assertNotIn('\r', t.keys)
+        self.assertIn('XX', t.composer)  # not ours alone to delete: left for a person, who is told now
+        notes = [x for x in bus.messages().values() if x['from'] == 'bus']
+        self.assertEqual(sorted(x['to'] for x in notes), ['boss', 'me'])
+        self.assertIn('Enter was NOT pressed', notes[0]['text'])
+        self.assertEqual(bus.messages()[m['id']]['state'], 'queued')
+
+    def test_text_the_bus_did_not_write_alerts_owner_notify_and_senders_once(self):
+        bus, orca, clock, d = make(self.tmp, alert_after=120, draft_grace=1800)
+        (Path(self.tmp) / 'config.json').write_text(json.dumps({'notify': ['boss']}))
+        for n in ('boss', 'lead', 'a', 'b'):
+            bus.register(n, None, 'shell')
+        t = orca.add('term_c', FakeTerm('claude', composer='half a thought'))
+        bus.register('c', 'term_c', 'claude', owner='lead')
+        m1 = bus.send('a', 'c', 'one')
+        bus.send('b', 'c', 'two')
+        d.tick()
+        notes = lambda: [x for x in bus.messages().values() if x['from'] == 'bus']
+        self.assertEqual(notes(), [])  # a person may be mid-sentence: no alarm yet
+        for _ in range(20):
+            clock.t += 20
+            d.tick()
+        self.assertEqual(sorted(x['to'] for x in notes()), ['a', 'b', 'boss', 'lead'])  # once, never to c itself
+        self.assertIn('did not write', notes()[0]['text'])
+        self.assertEqual(t.composer, 'half a thought')
+        for _ in range(100):
+            clock.t += 20
+            d.tick()
+        self.assertEqual(bus.messages()[m1['id']]['state'], 'failed')
+
+    def test_out_of_sync_screen_alerts_with_the_remedy_then_delivers_when_fixed(self):
+        bus, orca, clock, d = make(self.tmp, alert_after=120)
+        (Path(self.tmp) / 'config.json').write_text(json.dumps({'notify': ['boss']}))
+        bus.register('boss', None, 'shell')
+        t = orca.add('term_c', FakeTerm('claude', desync=True))
+        bus.register('c', 'term_c', 'claude')
+        m = bus.send('boss', 'c', 'hi')
+        for _ in range(10):
+            d.tick(); clock.t += 20
+        self.assertEqual(t.keys, [])
+        notes = [x for x in bus.messages().values() if x['from'] == 'bus']
+        self.assertEqual(len(notes), 1)
+        self.assertIn('Resize that pane', notes[0]['text'])
+        t.desync = False  # someone resized the pane
+        self.assertEqual(run_until_settled(d, clock, bus, m['id'])['state'], 'delivered')
+        self.assertNotIn('c', d.stuck)
 
     def test_booting_tab_waits(self):
         bus, orca, clock, d = make(self.tmp)

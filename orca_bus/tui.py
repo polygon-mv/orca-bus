@@ -70,6 +70,43 @@ def composer_text(kind, lines, draft=None):
     return ''
 
 
+RULE = re.compile(r'^\s*─{8,}\s*$')
+
+
+def claude_frame(lines):
+    """(ok, why): can this Claude screen be trusted to show the input box?
+
+    Claude draws its input box between two full-width rules with the footer below. If Orca's copy of the screen is
+    a different size from the real pane (it starts at 80x24 when a tab is restored before its size is known, and only
+    a layout resize fixes it), Claude's output lands at the wrong columns. The prompt row then mixes the ghost
+    suggestion with pieces of the footer, and Orca's `draft` reports that mix as typed text. Nothing read from such a
+    frame is evidence of anything."""
+    rows = [l for l in lines if l.strip()]
+    prompt = [i for i, l in enumerate(rows) if l.lstrip().startswith('❯')]
+    if not prompt:
+        return False, 'no prompt line'
+    p = prompt[-1]
+    above = [i for i in range(p) if RULE.match(rows[i])]
+    below = [i for i in range(p + 1, len(rows)) if RULE.match(rows[i])]
+    if not above or not below:
+        return False, 'screen out of sync: no rules around the input box'
+    width = len(rows[above[-1]].rstrip())
+    if len(rows[below[0]].rstrip()) != width:
+        return False, 'screen out of sync: rules of different widths'
+    return True, ''
+
+
+def frame_ok(kind, lines):
+    if kind == 'claude':
+        return claude_frame(lines)
+    return True, ''
+
+
+def same_text(a, b):
+    """Orca soft-wraps a long draft at the pane width (a newline where a space was): compare modulo whitespace."""
+    return ' '.join((a or '').split()) == ' '.join((b or '').split())
+
+
 def queue_hint(lines):
     """Codex mid-turn says 'tab to queue message': Enter does not queue there, Tab does."""
     return any('tab to queue' in l.lower() for l in lines[-6:])

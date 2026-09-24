@@ -26,7 +26,8 @@ orca-bus fixes each one:
 |---|---|
 | names change | a **registry** maps stable role names (`coordinator`, `builder`, `reviewer-2`) to the current Orca terminal handle; a restarted tab just runs `register <name>` again |
 | no common channel | one CLI for everyone; the **delivery daemon** types the message into Claude or Codex, a shell gets an inbox |
-| unreliable typing | waits for the TUI to finish booting and go idle, never types over someone else's draft, sends text and Enter as separate writes, re-sends Enter while the text is still a draft, and marks `delivered` only on **proof** |
+| unreliable typing | one writer per tab (a **typing lock**), waits for the TUI to finish booting and go idle, never types into a busy agent or over someone else's draft, checks the whole text landed intact before pressing Enter, re-sends Enter while the text is still a draft, and marks `delivered` only on **proof** |
+| a tab silently stops taking messages | its owner, the `notify` names and every waiting sender are **told** after 2 minutes, with the reason and the fix |
 | not durable | every message and every state change is appended to `log.jsonl`; `status` shows where each one is |
 
 ### Why not Orca's own orchestration mailbox?
@@ -62,13 +63,13 @@ tells the recipient to run to reply. A project wrapper script can put its own co
 ## CLI
 
 ```
-orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N]
-orca-bus send <to> "<one line>" [--from NAME] [--re ID]
+orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N] [--owner NAME]
+orca-bus send <to> "<one line>" [--from NAME] [--re ID] [--now]
 orca-bus inbox [--unread] [--as NAME] [--all] [--json]
 orca-bus ack <id>... [--as NAME]
 orca-bus who [--json]                  # names, kind, live/dead, tab title, daemon heartbeat
 orca-bus status [ID] [--json]          # the last 20 messages, or one, with state and reason
-orca-bus deliver [--once] [--interval 5] [--busy-grace S] [--max-attempts 5]
+orca-bus deliver [--once] [--interval 5] [--alert-after 120] [--draft-grace 1800] [--max-attempts 5]
 orca-bus unregister <name>
 ```
 
@@ -81,6 +82,16 @@ orca-bus unregister <name>
   arrives. Long content goes in a file, and the message carries its path.
 - `send --re <id>` replies to a message and acks it. A message to an unknown name fails at once (exit code 2) and
   is still logged.
+- `send --now` also tries one delivery right away, from the sending process, under the same lock and checks as the
+  daemon (useful when the daemon is down). If it cannot deliver yet, the message stays queued for the daemon.
+- `register --owner <name>`: who is alerted when this tab stops taking messages (the tab that started it, say). The
+  owner is kept when the tab re-registers after a restart.
+
+**Never type into another agent's tab with a raw `orca terminal send`.** It skips the typing lock and every check
+below. Two writers in one input box do not interleave characters (each `terminal send` is one write), but the
+second text is **appended** to the first, and the first writer's Enter submits both as one prompt. A raw send into
+a busy tab leaves the text sitting in the box as a draft, and every later delivery then waits on "someone else's
+text". Use `send` (or `send --now`).
 
 What the recipient sees in its input box, submitted as a prompt:
 
@@ -99,20 +110,31 @@ Messages to one recipient go strictly in order. For each open message:
 | unregistered name | `failed` |
 | `shell` kind (or no handle) | `inbox`: nothing is typed, read it with `inbox` |
 | handle not in `orca terminal list` | `failed`: "tab closed", sender and `notify` names told |
+| another writer holds the tab's typing lock | wait (never two writers in one input box) |
 | TUI still booting | wait |
-| input box holds someone else's text | wait; never typed over; `failed` after 30 min |
-| agent busy | wait for its next idle (see `--busy-grace`) |
-| idle and empty | type the text, pause, send CR as a separate write, check; up to 3 CRs while the text is still in the box |
+| screen does not show the input box's shape | wait; **alert** after `--alert-after`; `failed` after `--draft-grace` |
+| input box holds text the bus did not write | wait, never typed over; **alert** after `--alert-after`; `failed` after `--draft-grace` |
+| agent busy | wait for its next idle, however long; **nothing is typed into a busy agent** |
+| idle and empty | type the text; check the agent is still idle and the box holds exactly that text; only then send CR as a separate write; up to 3 CRs while the text is still in the box |
+| the check after typing fails | the agent started a turn: our text is taken back out (Backspace), wait. Someone else typed first: ours is taken back out, theirs left alone. Anything else: Enter is **not** pressed and the owner and `notify` names are alerted at once |
 | no proof | `retry` with backoff 15 s, 30 s, 60 s...; `failed` after `--max-attempts`, with a notice |
+
+**One writer per tab.** Every path that types into a tab (the daemon, `send --now`, a second daemon started by
+mistake) first takes `<bus>/locks/<name>.lock` and holds it from the first screen read to the proof of submission. A
+lock left by a killed writer is broken after 2 minutes.
 
 **Proof of delivery** means the composer no longer holds the text and the message id appears in the terminal output.
 Before every attempt the daemon checks whether the id is already on screen, so a daemon that died mid-delivery never
 sends a duplicate.
 
-`--busy-grace S`: after S seconds of waiting on a busy agent, hand the message to the agent's **own queue**: Enter
-while Claude Code is working (it shows the message to the agent at its next step, between tool calls), Tab while
-Codex is working (Codex's "tab to queue message"). Neither interrupts a running tool. Without it the daemon waits
-for a real idle, which can be hours for a long-running agent.
+**Alerts.** When a tab cannot take messages for a reason only a person can fix (text in its box that the bus did
+not write, or a screen that cannot be read), the daemon waits `--alert-after` seconds (a person may be mid-sentence)
+and then sends one `BLOCKED` notice, with the reason and the fix, to the tab's owner, the `notify` names and the
+sender of every message waiting for that tab. It does not go on waiting silently. There is one notice per episode;
+the next one comes only after the tab has taken a message or the reason changes.
+
+`--busy-grace` is accepted for old command lines and ignored. Earlier versions typed into a busy agent's own queue
+after that many seconds. That leaves text in the box whenever the queue does not take it, so it was removed.
 
 ### TUI quirks it handles (Claude Code 2.1, Codex 0.156)
 
@@ -128,6 +150,17 @@ for a real idle, which can be hours for a long-running agent.
   then is lost or left unsubmitted.
 - **Stale screens:** proof is read from `terminal read --screen` plus the scrollback, never inferred from a send
   receipt, since `input_accepted` does not mean the prompt was submitted.
+- **A screen copy of the wrong size.** Orca keeps its own copy of each terminal's screen for `terminal read
+  --screen`. If a tab is restored before its size is known (after a restart, say), that copy starts at 80x24 and
+  is only fixed by a real resize of a pane that is on screen. Claude draws for the real width, so the copy is
+  garbage: words at column 0 and stray letters at column 79, and a prompt row where the ghost suggestion is mixed
+  with pieces of the footer (`...tonighthell, 1 mon  or st ll  unning`). Orca's `draft` is derived from that same
+  copy and reports the mix as typed text. The daemon only trusts a Claude screen that has the input box's shape
+  (two rules of the same width around the prompt). Otherwise it waits and alerts with the fix: show the tab and
+  resize its pane once (drag a divider, or maximise and restore the window). No typing is needed.
+- **Long drafts come back soft-wrapped**: Orca's `draft` has a newline where the pane wrapped a space. The
+  "landed intact" check compares modulo whitespace.
+- **Text typed into a busy Claude** is kept as a draft through the turn and is still there afterwards, unsent.
 
 ## Files
 
@@ -146,9 +179,11 @@ Writes take a lock file (safe on Windows and POSIX), and a torn last log line fr
 python -m unittest discover -s tests -t .
 ```
 
-The delivery logic runs against a fake Orca whose terminals reproduce the quirks above: swallowed Enter, Codex's
-Tab-only queue, booting, busy, someone else's draft, a closed tab, a Claude ghost suggestion, a daemon that died
-after delivering. Store tests cover concurrent writers, replies, acks and restarts.
+The delivery logic runs against a fake Orca whose terminals reproduce the quirks above: swallowed Enter, booting,
+busy, someone else's draft, a closed tab, a Claude ghost suggestion, a daemon that died after delivering, a screen
+copy of the wrong size, a turn that starts while the text is typed, a person typing at the same moment, and two
+writers delivering into one tab at once (from two threads). Store tests cover concurrent writers, the typing lock
+(including a stale one), replies, acks and restarts. Each new test was checked by removing the code it guards.
 
 ## Licence
 

@@ -4,16 +4,21 @@ RULE = '─' * 40
 
 
 class FakeTerm:
-    def __init__(self, kind, busy=False, swallow=0, booting=False, composer='', report_draft=True):
+    def __init__(self, kind, busy=False, swallow=0, booting=False, composer='', report_draft=True, desync=False):
         self.kind, self.busy, self.swallow, self.booting = kind, busy, swallow, booting
         self.composer, self.history, self.queued = composer, [], []
         self.report_draft = report_draft
+        self.desync = desync        # Orca's screen copy is 80x24 while the pane is wider: the frame is garbage
+        self.on_type = None         # hook(term, text) run after a text write: another writer, a turn starting
         self.keys = []
 
     def type(self, text):
         self.keys.append(text)
         if self.booting:
             return  # typed while booting: lost
+        if text and set(text) == {'\x7f'}:  # Backspace
+            self.composer = self.composer[:-len(text)] if len(text) <= len(self.composer) else ''
+            return
         if text in ('\r', '\t'):
             if not self.composer:
                 return
@@ -28,12 +33,18 @@ class FakeTerm:
                 self.history.append(self.composer)
             self.composer = ''
             return
-        self.composer += text
+        self.composer += text  # Claude keeps text typed mid-turn as a draft
+        if self.on_type:
+            hook, self.on_type = self.on_type, None
+            hook(self, text)
 
     def lines(self):
         if self.kind == 'claude':
             if self.booting:
                 return ['Claude Code starting']
+            if self.desync:  # captured shape: words at column 0, a stray char at column 79, no rules
+                return ['ow' + ' ' * 77 + 'm', 'emory,' + ' ' * 73 + 'C', 'ead.' + ' ' * 75 + 'O',
+                        '❯\xa0run the tests tonighthell, 1 mon  or st ll  unning']
             out = [f'❯ {h}' for h in self.history]
             out += [f'  queued: {q}' for q in self.queued]
             if self.busy:
@@ -63,6 +74,8 @@ class FakeOrca:
 
     def screen(self, handle):
         t = self.terms[handle][0]
+        if t.desync:  # Orca derives `draft` from the same broken frame
+            return t.lines(), 'run the tests tonighthell, 1 mon  or st ll  unning'
         return t.lines(), (t.composer or None) if t.report_draft else None
 
     def scrollback(self, handle, limit=400):

@@ -1,7 +1,8 @@
 """Durable state of a bus: registry, append-only message log, per-recipient inboxes.
 
 Layout of a bus directory:
-    registry.json      stable name -> {handle, kind, session, note, updated}
+    registry.json      stable name -> {handle, kind, session, note, owner, updated}
+    locks/<name>.lock  held by whoever is typing into <name>'s tab right now
     log.jsonl          every message and every state change, append-only (the record)
     inbox/<name>.jsonl messages addressed to <name>, append-only (a convenience copy)
     config.json        optional: {"notify": [...], "reply_cmd": "...", "max_len": 600}
@@ -77,37 +78,71 @@ class Bus:
         return cfg
 
     # ---- locking (portable: an O_EXCL lock file, broken if older than `stale` seconds)
+    @staticmethod
+    def _try_lock(path, stale, holder=''):
+        """Take the lock file at `path` once; True on success. A lock older than `stale` seconds is broken."""
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, (holder or str(os.getpid())).encode())
+            os.close(fd)
+            return True
+        except (FileExistsError, PermissionError):
+            # Windows raises PermissionError while another writer's delete of the lock is still pending
+            try:
+                if time.time() - path.stat().st_mtime > stale:
+                    path.unlink()
+            except (FileNotFoundError, PermissionError):
+                pass
+            return False
+
+    @staticmethod
+    def _unlock(path):
+        for _ in range(100):
+            try:
+                path.unlink()
+                return
+            except FileNotFoundError:
+                return
+            except PermissionError:  # a reader has it open for a moment (Windows)
+                time.sleep(0.01)
+
     @contextmanager
     def lock(self, timeout=30, stale=60):
         t0 = time.time()
-        while True:
-            try:
-                fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, str(os.getpid()).encode())
-                os.close(fd)
-                break
-            except (FileExistsError, PermissionError):
-                # Windows raises PermissionError while another writer's delete of the lock is still pending
-                try:
-                    if time.time() - self.lock_path.stat().st_mtime > stale:
-                        self.lock_path.unlink()
-                        continue
-                except (FileNotFoundError, PermissionError):
-                    pass
-                if time.time() - t0 > timeout:
-                    raise BusError(f'bus lock busy for {timeout}s: {self.lock_path}')
-                time.sleep(0.05)
+        while not self._try_lock(self.lock_path, stale):
+            if time.time() - t0 > timeout:
+                raise BusError(f'bus lock busy for {timeout}s: {self.lock_path}')
+            time.sleep(0.05)
         try:
             yield
         finally:
-            for _ in range(100):
-                try:
-                    self.lock_path.unlink()
-                    break
-                except FileNotFoundError:
-                    break
-                except PermissionError:  # a reader has it open for a moment (Windows)
-                    time.sleep(0.01)
+            self._unlock(self.lock_path)
+
+    # ---- per-recipient typing lock
+    # Only one writer may type into a tab at a time. Two `terminal send`s into one input box concatenate: the first
+    # writer's Enter then submits both texts as one prompt. Every code path that types into a tab (the daemon, a
+    # `send --now`, a second daemon started by mistake) takes this lock first and holds it from the screen check to
+    # the proof of submission.
+    def typing_lock_path(self, name):
+        return self.root / 'locks' / f'{check_name(name)}.lock'
+
+    @contextmanager
+    def typing_lock(self, name, holder, stale=120):
+        """Yield True while holding `name`'s typing lock, False (at once, no waiting) if someone else holds it."""
+        path = self.typing_lock_path(name)
+        path.parent.mkdir(exist_ok=True)
+        got = self._try_lock(path, stale, json.dumps({'holder': holder, 'pid': os.getpid(), 'time': time.time()}))
+        try:
+            yield got
+        finally:
+            if got:
+                self._unlock(path)
+
+    def typing_lock_holder(self, name):
+        try:
+            return json.loads(self.typing_lock_path(name).read_text(encoding='utf-8'))
+        except (FileNotFoundError, ValueError, PermissionError):
+            return None
 
     # ---- registry
     def registry(self):
@@ -120,14 +155,19 @@ class Bus:
         tmp.write_text(json.dumps(reg, indent=1, sort_keys=True), encoding='utf-8')
         os.replace(tmp, self.reg_path)
 
-    def register(self, name, handle=None, kind='shell', session=None, note=None):
+    def register(self, name, handle=None, kind='shell', session=None, note=None, owner=None):
         check_name(name)
         if kind not in KINDS:
             raise BusError(f'kind must be one of {KINDS}')
         with self.lock():
             reg = self.registry()
             old = reg.get(name)
-            reg[name] = {'handle': handle, 'kind': kind, 'session': session, 'note': note, 'updated': now_iso()}
+            if owner:
+                check_name(owner)
+            elif old:
+                owner = old.get('owner')  # a restarted tab re-registering its name keeps the name's owner
+            reg[name] = {'handle': handle, 'kind': kind, 'session': session, 'note': note, 'owner': owner,
+                         'updated': now_iso()}
             self._save_registry(reg)
             self._append({'ev': 'register', 'name': name, 'handle': handle, 'kind': kind, 'session': session,
                           'previous_handle': old and old.get('handle'), 'time': now_iso()})

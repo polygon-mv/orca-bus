@@ -1,12 +1,15 @@
 """orca-bus: one message bus for every terminal tab, whatever runs in it (Claude Code, Codex, a shell).
 
-  orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N]
-  orca-bus send <to> "<text>" [--from NAME] [--re ID]
+  orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N] [--owner NAME]
+  orca-bus send <to> "<text>" [--from NAME] [--re ID] [--now]
   orca-bus inbox [--unread] [--as NAME] [--json]
   orca-bus ack <id> [--as NAME]
   orca-bus who [--json]
   orca-bus status [ID]
-  orca-bus deliver [--once] [--interval S] [--busy-grace S] [--max-attempts N]
+  orca-bus deliver [--once] [--interval S] [--alert-after S] [--draft-grace S] [--max-attempts N]
+
+Never type into another agent's tab with a raw `orca terminal send`: it bypasses the per-tab typing lock, and two
+writers in one input box concatenate into one prompt. Use `send` (the daemon types it) or `send --now`.
 
 The bus directory is --dir, else $ORCA_BUS_DIR, else the nearest `.orca-bus/` above the current directory.
 Your own name is --from/--as, else $ORCA_BUS_NAME, else the registry entry for this terminal's
@@ -67,9 +70,12 @@ def main(argv=None, root=None, default_reply_cmd=None):
     r = sub.add_parser('register', help='map a stable name to this (or a given) terminal')
     r.add_argument('name'); r.add_argument('--handle'); r.add_argument('--kind', choices=['claude', 'codex', 'shell'])
     r.add_argument('--session'); r.add_argument('--note')
+    r.add_argument('--owner', help='who is alerted when this tab cannot take messages (a registered name)')
     u = sub.add_parser('unregister'); u.add_argument('name')
     s = sub.add_parser('send', help='send one line (<= max_len chars) to a registered name')
     s.add_argument('to'); s.add_argument('text'); s.add_argument('--from', dest='frm'); s.add_argument('--re', dest='reply_to')
+    s.add_argument('--now', action='store_true',
+                   help='try one delivery right here (same lock and checks as the daemon); if it cannot, the daemon keeps it')
     i = sub.add_parser('inbox'); i.add_argument('--unread', action='store_true'); i.add_argument('--as', dest='me')
     i.add_argument('--json', action='store_true'); i.add_argument('--all', action='store_true', help='every message on the bus')
     a = sub.add_parser('ack'); a.add_argument('ids', nargs='+'); a.add_argument('--as', dest='me')
@@ -78,8 +84,12 @@ def main(argv=None, root=None, default_reply_cmd=None):
     d = sub.add_parser('deliver', help='run the delivery daemon (in its own plain terminal)')
     d.add_argument('--once', action='store_true'); d.add_argument('--interval', type=float, default=5)
     d.add_argument('--busy-grace', type=float, default=None,
-                   help='seconds to wait for idle before using the agent\'s own queue (default: wait for idle)')
+                   help='ignored (kept for old command lines): a busy agent is never typed into')
     d.add_argument('--max-attempts', type=int, default=5); d.add_argument('--settle', type=float, default=3.0)
+    d.add_argument('--alert-after', type=float, default=120,
+                   help='seconds a tab may stay blocked (text the bus did not write, unreadable screen) before its '
+                        'owner, the notify names and the waiting senders are told')
+    d.add_argument('--draft-grace', type=float, default=1800, help='seconds before a blocked message fails')
     args = p.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):  # titles carry spinner glyphs; a cp1252 console must not crash on them
         try:
@@ -99,7 +109,7 @@ def main(argv=None, root=None, default_reply_cmd=None):
                 terms = live_terminals() or {}
                 agent = (terms.get(handle) or {}).get('agent')
                 kind = agent if agent in ('claude', 'codex') else 'shell'
-            old = bus.register(args.name, handle, kind, args.session, args.note)
+            old = bus.register(args.name, handle, kind, args.session, args.note, args.owner)
             moved = f' (was {old.get("handle")})' if old and old.get('handle') != handle else ''
             print(f'registered {args.name} -> {handle} [{kind}]{moved}')
         elif args.cmd == 'unregister':
@@ -108,6 +118,14 @@ def main(argv=None, root=None, default_reply_cmd=None):
             frm = whoami(bus, args.frm)
             m = bus.send(frm, args.to, args.text, args.reply_to)
             print(f'queued {m["id"]} {frm} -> {args.to}')
+            if args.now:
+                from .deliver import Deliverer
+                from .orca import Orca
+                orca = Orca()
+                Deliverer(bus, orca, holder=f'send --now by {frm}').deliver(
+                    bus.messages()[m['id']], bus.registry().get(args.to), orca.terminals())
+                m = bus.messages()[m['id']]
+                print(f'{m["id"]} {m["state"]}: {m["history"][-1][2]}')
         elif args.cmd == 'inbox':
             if args.all:
                 ms = sorted(bus.messages().values(), key=lambda m: m['time'])
@@ -142,7 +160,8 @@ def main(argv=None, root=None, default_reply_cmd=None):
             from .deliver import run
             from .orca import Orca
             run(bus, Orca(), interval=args.interval, once=args.once, busy_grace=args.busy_grace,
-                max_attempts=args.max_attempts, settle=args.settle)
+                max_attempts=args.max_attempts, settle=args.settle, alert_after=args.alert_after,
+                draft_grace=args.draft_grace)
     except BusError as ex:
         print(f'orca-bus: {ex}', file=sys.stderr)
         return 2

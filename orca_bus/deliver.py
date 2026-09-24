@@ -3,12 +3,23 @@ on proof (the composer is empty again and the message id is in the terminal outp
 
 Per recipient kind:
   shell   inbox only (nothing is typed into a plain terminal)
-  claude  wait until idle and the input box is empty, type the text, send a separate CR
-  codex   same; Codex 0.15x can swallow the Enter or leave the text as a draft, so re-send CR;
-          mid-turn, Enter does not queue in Codex but Tab does
-A busy agent is never interrupted: the message waits for the next idle. With --busy-grace N, after N seconds
-of waiting it is handed to the agent's own queue (Claude: Enter while busy; Codex: Tab), which also never
-interrupts a running tool.
+  claude  wait until idle and the input box is empty, type the text, check it landed intact, send a separate CR
+  codex   same; Codex 0.15x can swallow the Enter or leave the text as a draft, so re-send CR
+
+Rules every typed delivery follows (brief: two writers garbled one input box):
+  - ONE WRITER PER TAB. The recipient's typing lock (store.Bus.typing_lock) is held from the first screen read to
+    the proof of submission. Anyone else who would type into that tab (a `send --now`, a second daemon) waits.
+    Two unlocked `terminal send`s into one box concatenate, and one Enter submits both as a single prompt.
+  - NEVER TYPE INTO A BUSY AGENT. Busy means wait for its next idle, however long. Text typed mid-turn sits in the
+    input box as an unsent draft (and the next writer sees "someone else's text").
+  - EMPTY BEFORE, INTACT AFTER. The input box must be empty before typing; after typing, it must hold exactly our
+    text (and the agent must still be idle) before Enter is pressed. If it does not, our text is taken back out
+    when that can be done without touching anyone else's, and Enter is never pressed on a mix.
+  - DON'T TRUST A BROKEN SCREEN. If the screen does not have the input box's shape (Orca's copy of the screen is
+    a different size from the pane), nothing read from it counts as evidence.
+  - SAY SO, DON'T WAIT SILENTLY. When a tab's input box holds text the bus did not write, or its screen cannot be
+    read, for `alert_after` seconds, the recipient's owner, the `notify` names and the waiting senders are told once,
+    with the reason and the remedy. The message itself fails after `draft_grace`.
 """
 import datetime
 import json
@@ -18,15 +29,30 @@ import time
 from . import tui
 from .store import OPEN_STATES
 
+DEL = '\x7f'  # what Backspace sends in Claude Code and Codex
+
+REMEDY = {
+    'foreign': 'Someone has to look at that tab and submit or clear its input box (its owner, or a person). '
+               'The bus never clears text it did not write.',
+    'mixed': 'The box holds bus text mixed with other text and Enter was NOT pressed. Clear the input box in that tab '
+             '(Esc or Ctrl+U) or have its owner do it; the bus retries on its own afterwards.',
+    'desync': "Orca's copy of that tab's screen is out of sync with the pane (it starts at 80x24 when a tab is "
+              "restored before its size is known), so nobody can read its input box. Resize that pane once (drag a "
+              "divider, or maximise and restore the window). No typing is needed.",
+}
+
 
 class Deliverer:
-    def __init__(self, bus, orca, busy_grace=None, draft_grace=1800, max_attempts=5, backoff=15, settle=3.0,
-                 poll=10, sleep=time.sleep, clock=time.time, log=None):
+    def __init__(self, bus, orca, busy_grace=None, draft_grace=1800, alert_after=120, max_attempts=5, backoff=15,
+                 settle=3.0, poll=10, holder='daemon', sleep=time.sleep, clock=time.time, log=None):
         self.bus, self.orca = bus, orca
-        self.busy_grace, self.draft_grace = busy_grace, draft_grace
+        self.busy_grace = busy_grace  # kept for old command lines; a busy agent is never typed into any more
+        self.draft_grace, self.alert_after = draft_grace, alert_after
         self.max_attempts, self.backoff, self.settle, self.poll = max_attempts, backoff, settle, poll
+        self.holder = holder
         self.sleep, self.clock = sleep, clock
         self.log = log or (lambda s: None)
+        self.stuck = {}  # recipient -> {'cls', 'since', 'alerted'}: one alert per blocked episode
 
     # ------------------------------------------------------------------ formatting
     def format(self, m):
@@ -75,18 +101,42 @@ class Deliverer:
         self.log(f'FAILED {m["id"]} -> {m["to"]}: {why}')
         if m['from'] == 'bus':
             return
+        self.notify([m['from']], m['to'], f'FAILED {m["id"]} to {m["to"]}: {why}. Text: {m["text"][:200]}')
+
+    def done(self, m, how):
+        self.stuck.pop(m['to'], None)
+        self.bus.set_state(m['id'], 'delivered', how, attempts=m.get('attempts', 0) + 1)
+        self.log(f'DELIVERED {m["id"]} -> {m["to"]}: {how}')
+
+    def notify(self, first, about, text):
+        """Tell `first` + the recipient's owner + the configured notify names, never the blocked tab itself."""
         reg = self.bus.registry()
-        tell = [m['from']] + list(self.bus.config().get('notify', []))
+        owner = (reg.get(about) or {}).get('owner')
+        tell = list(first) + ([owner] if owner else []) + list(self.bus.config().get('notify', []))
         for name in dict.fromkeys(tell):
-            if name in reg and name != m['to']:
+            if name in reg and name not in (about, 'bus'):
                 try:
-                    self.bus.send('bus', name, f'FAILED {m["id"]} to {m["to"]}: {why}. Text: {m["text"][:200]}')
+                    self.bus.send('bus', name, text[:590])
                 except Exception as ex:
                     self.log(f'NOTIFY {name} failed: {ex}')
 
-    def done(self, m, how):
-        self.bus.set_state(m['id'], 'delivered', how, attempts=m.get('attempts', 0) + 1)
-        self.log(f'DELIVERED {m["id"]} -> {m["to"]}: {how}')
+    def blocked(self, m, cls, why, since, now_alert=False):
+        """The tab cannot take a message for a reason a person has to fix: wait, alert once, fail at draft_grace."""
+        to, now = m['to'], self.clock()
+        st = self.stuck.get(to)
+        if not st or st['cls'] != cls:
+            st = self.stuck[to] = {'cls': cls, 'since': now, 'alerted': False}
+        if not st['alerted'] and (now_alert or now - st['since'] >= self.alert_after):
+            st['alerted'] = True
+            waiting = sorted((x for x in self.bus.messages().values() if x['to'] == to and x['state'] in OPEN_STATES),
+                             key=lambda x: x['time'])
+            senders = [x['from'] for x in waiting]
+            self.log(f'ALERT {to}: {why}')
+            self.notify(senders, to, f'BLOCKED {to}: deliveries held {int(now - st["since"])}s: {why}. {REMEDY[cls]} '
+                                     f'Waiting: {len(waiting)} message(s), oldest {m["id"]} from {m["from"]}.')
+        if now - since > self.draft_grace:
+            return self.fail(m, f'{why} for {int(now - since)}s')
+        return self.later(m, why, since)
 
     # ------------------------------------------------------------------ the typed delivery
     def proven(self, handle, kind, token):
@@ -105,42 +155,74 @@ class Deliverer:
             return self.bus.set_state(m['id'], 'inbox', 'shell recipient: inbox only (read with `inbox`)')
         if handle not in terms:
             return self.fail(m, f'tab closed: handle {handle} is not a live Orca terminal (re-register {m["to"]})')
-        token = m['id']
+        since = m.get('waiting_since') or self.clock()
+        with self.bus.typing_lock(m['to'], self.holder) as got:
+            if not got:
+                h = self.bus.typing_lock_holder(m['to']) or {}
+                return self.later(m, f'another sender is typing into {m["to"]} ({h.get("holder", "?")}, '
+                                     f'pid {h.get("pid", "?")}): waiting for it to finish', since)
+            return self._deliver_locked(m, handle, kind, terms[handle].get('title', ''), since)
+
+    def _deliver_locked(self, m, handle, kind, title, since):
+        token, text = m['id'], self.format(m)
         ok, comp = self.proven(handle, kind, token)
         if ok:  # already there (a previous attempt worked but the daemon died before recording it)
             return self.done(m, 'found in terminal output')
         lines, draft = self.orca.screen(handle)
-        title = terms[handle].get('title', '')
+        if not tui.is_ready(kind, lines):
+            if kind == 'claude' and self.clock() - since > self.alert_after:
+                return self.blocked(m, 'desync', 'no input box on the screen', since)
+            return self.later(m, 'TUI still booting', since)
+        good, why = tui.frame_ok(kind, lines)
+        if not good:
+            return self.blocked(m, 'desync', why, since)
         comp = tui.composer_text(kind, lines, draft)
         ours = token in comp
-        now = self.clock()
-        since = m.get('waiting_since') or now
-        if not tui.is_ready(kind, lines):
-            return self.later(m, 'TUI still booting', since)
         if comp and not ours:
-            if now - since > self.draft_grace:
-                return self.fail(m, f'input box held other text for {int(now - since)}s: {comp[:60]!r}')
-            return self.later(m, 'input box not empty (someone is typing, or a stale draft)', since)
-        busy = tui.is_busy(kind, lines, title)
-        queue_key = None
-        if busy:
-            if self.busy_grace is None or now - since < self.busy_grace:
-                return self.later(m, 'recipient busy: waiting for its next idle', since)
-            queue_key = '\t' if kind == 'codex' and tui.queue_hint(lines) else '\r'
+            return self.blocked(m, 'foreign', f'input box holds text the bus did not write: {comp[:60]!r}', since)
+        if ours and not tui.same_text(comp, text):
+            return self.blocked(m, 'mixed', f'input box holds {token} mixed with other text: {comp[:60]!r}', since,
+                                now_alert=True)
+        if tui.is_busy(kind, lines, title):
+            if ours:  # left by an attempt that raced the agent's turn start: take it back out, it is exactly ours
+                self.undo(handle, text)
+            self.stuck.pop(m['to'], None)
+            return self.later(m, 'recipient busy: waiting for its next idle', since)
         if not ours:
-            if not self.orca.send(handle, self.format(m)):
+            if not self.orca.send(handle, text):
                 return self.retry(m, 'orca did not accept the text')
             self.sleep(0.8)
-        submit = queue_key or '\r'
+            # verify before Enter: still idle, and the box holds exactly our text
+            lines, draft = self.orca.screen(handle)
+            comp = tui.composer_text(kind, lines, draft)
+            if tui.is_busy(kind, lines, self.orca.terminals().get(handle, {}).get('title', '')):
+                if tui.same_text(comp, text):
+                    self.undo(handle, text)
+                    return self.later(m, 'recipient became busy while the text was typed: took it back out', since)
+                return self.blocked(m, 'mixed', f'recipient became busy and the box holds {comp[:60]!r}', since,
+                                    now_alert=True)
+            if not tui.same_text(comp, text):
+                if ' '.join(comp.split()).endswith(' '.join(text.split())) and token in comp:
+                    self.undo(handle, text)  # someone else's text came first: remove ours, leave theirs untouched
+                    return self.blocked(m, 'foreign', 'someone else typed into the box at the same moment: '
+                                                      'took our text back out', since)
+                if token not in comp:
+                    return self.retry(m, 'the typed text did not appear in the input box')
+                return self.blocked(m, 'mixed', f'typed text did not land intact: {comp[:60]!r}', since, now_alert=True)
         for i in range(3):  # Codex swallows an Enter now and then: re-send CR while the text is still a draft
-            self.orca.send(handle, submit)
+            self.orca.send(handle, '\r')
             self.sleep(self.settle)
             ok, comp = self.proven(handle, kind, token)
             if ok:
-                return self.done(m, ('queued in the agent (busy)' if queue_key else 'submitted') + (f' after {i + 1} keys' if i else ''))
+                return self.done(m, 'submitted' + (f' after {i + 1} keys' if i else ''))
             if token not in comp:
                 break
         return self.retry(m, 'no proof of submission' + (' (text still in the input box)' if token in comp else ''))
+
+    def undo(self, handle, text):
+        """Delete our own text from the end of the input box (only ever called when the box ends with exactly it)."""
+        self.orca.send(handle, DEL * len(text))
+        self.sleep(0.5)
 
 
 def run(bus, orca, interval=5, once=False, **kw):
@@ -164,7 +246,8 @@ def run(bus, orca, interval=5, once=False, **kw):
     pidf.write_text(json.dumps({'pid': os.getpid(), 'started': time.time()}))
     d = Deliverer(bus, orca, log=log, **kw)
     stop = root / 'deliver.STOP'
-    log(f'START bus={root} busy_grace={d.busy_grace} max_attempts={d.max_attempts}')
+    log(f'START bus={root} alert_after={d.alert_after} draft_grace={d.draft_grace} max_attempts={d.max_attempts}'
+        + (' (--busy-grace is ignored: a busy agent is never typed into)' if d.busy_grace is not None else ''))
     while not stop.exists():
         (root / 'deliver.heartbeat').write_text(str(time.time()))
         try:
