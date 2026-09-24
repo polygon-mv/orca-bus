@@ -117,6 +117,27 @@ class StoreTests(unittest.TestCase):
         self.bus.register('w', 'term_2', 'claude')
         self.assertEqual(self.bus.registry()['w']['owner'], 'lead')
 
+    def test_follow_yields_only_new_messages_as_they_arrive(self):
+        self.bus.register('t', None, 'shell')
+        self.bus.send('a', 't', 'old')
+        got, sent = [], []
+
+        def tick(_):  # the "sleep" between polls: deliver one new message, then stop
+            if not sent:
+                sent.append(self.bus.send('a', 't', 'new')['id'])
+        g = self.bus.follow('t', sleep=tick, stop=lambda: len(got) >= 1 or len(sent) > 1)
+        for m in g:
+            got.append(m)
+            break
+        self.assertEqual([m['text'] for m in got], ['new'])
+
+    def test_mode_is_kept_across_re_register(self):
+        self.bus.register('w', 'term_1', 'claude', mode='inbox')
+        self.bus.register('w', 'term_2', 'claude')
+        self.assertEqual(self.bus.registry()['w']['mode'], 'inbox')
+        with self.assertRaises(BusError):
+            self.bus.register('w', 'term_2', 'claude', mode='carrier-pigeon')
+
     def test_torn_log_line_is_skipped(self):
         self.bus.register('t', None, 'shell')
         self.bus.send('a', 't', 'one')
@@ -397,6 +418,15 @@ class DeliverTests(unittest.TestCase):
     def test_stale_copy_draws_spaces_as_the_rule_underneath(self):
         self.assertTrue(tui.input_row_starts_with([], '[bus─m1─from─a]─hello─th', '[bus m1 from '))
         self.assertFalse(tui.input_row_starts_with(['❯ hello [bus m1 from x]'], None, '[bus m1 from '))
+
+    def test_inbox_mode_is_never_typed_into(self):
+        bus, orca, clock, d = make(self.tmp)
+        t = orca.add('term_c', FakeTerm('claude'))
+        bus.register('c', 'term_c', 'claude', mode='inbox')
+        m = bus.send('me', 'c', 'read me from your inbox')
+        d.tick()
+        self.assertEqual(bus.messages()[m['id']]['state'], 'inbox')
+        self.assertEqual(t.keys, [])
 
     def test_booting_tab_waits(self):
         bus, orca, clock, d = make(self.tmp)

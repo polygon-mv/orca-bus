@@ -64,8 +64,9 @@ tells the recipient to run to reply. A project wrapper script can put its own co
 
 ```
 orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N] [--owner NAME]
+                  [--mode typed|inbox]
 orca-bus send <to> "<one line>" [--from NAME] [--re ID] [--now]
-orca-bus inbox [--unread] [--as NAME] [--all] [--json]
+orca-bus inbox [--unread] [--as NAME] [--all] [--json] [--follow]
 orca-bus ack <id>... [--as NAME]
 orca-bus who [--json]                  # names, kind, live/dead, tab title, daemon heartbeat
 orca-bus status [ID] [--json]          # the last 20 messages, or one, with state and reason
@@ -86,6 +87,21 @@ orca-bus unregister <name>
   daemon (useful when the daemon is down). If it cannot deliver yet, the message stays queued for the daemon.
 - `register --owner <name>`: who is alerted when this tab stops taking messages (the tab that started it, say). The
   owner is kept when the tab re-registers after a restart.
+
+### Long-running agents: watch your inbox instead of being typed to
+
+An agent that is almost always mid-turn (a scheduler, a coordinator, a build watcher) only receives typed messages
+at its rare idle moments. It can take them from its inbox file instead:
+
+```
+orca-bus register scheduler --mode inbox        # the daemon never types into this tab
+orca-bus inbox --follow --unread                # one line per message, forever: run it under a Monitor
+```
+
+`inbox --follow` prints each new message as the same one line a typed delivery would show, so a Claude Code
+Monitor (or any watcher) hands it to the agent between tool calls. The inbox file is append-only and the daemon is
+not involved, so a stale screen, a busy agent or a text in the input box cannot hold anything up. `--mode` is kept
+when the tab re-registers; `register <name> --mode typed` switches back.
 
 **Never type into another agent's tab with a raw `orca terminal send`.** It skips the typing lock and every check
 below. Two writers in one input box do not interleave characters (each `terminal send` is one write), but the
@@ -108,7 +124,7 @@ Messages to one recipient go strictly in order. For each open message:
 | recipient | what happens |
 |---|---|
 | unregistered name | `failed` |
-| `shell` kind (or no handle) | `inbox`: nothing is typed, read it with `inbox` |
+| `shell` kind (or no handle), or registered with `--mode inbox` | `inbox`: nothing is typed, read it with `inbox` / `inbox --follow` |
 | handle not in `orca terminal list` | `failed`: "tab closed", sender and `notify` names told |
 | another writer holds the tab's typing lock | wait (never two writers in one input box) |
 | TUI still booting | wait |

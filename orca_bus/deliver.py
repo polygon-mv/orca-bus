@@ -164,6 +164,8 @@ class Deliverer:
         handle, kind = entry.get('handle'), entry.get('kind', 'shell')
         if not handle or kind == 'shell':
             return self.bus.set_state(m['id'], 'inbox', 'shell recipient: inbox only (read with `inbox`)')
+        if entry.get('mode') == 'inbox':
+            return self.bus.set_state(m['id'], 'inbox', 'inbox mode: the tab watches `inbox --follow`, nothing is typed')
         if handle not in terms:
             return self.fail(m, f'tab closed: handle {handle} is not a live Orca terminal (re-register {m["to"]})')
         since = m.get('waiting_since') or self.clock()

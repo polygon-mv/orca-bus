@@ -1,8 +1,9 @@
 """orca-bus: one message bus for every terminal tab, whatever runs in it (Claude Code, Codex, a shell).
 
   orca-bus register <name> [--kind claude|codex|shell] [--handle H] [--session S] [--note N] [--owner NAME]
+                    [--mode typed|inbox]
   orca-bus send <to> "<text>" [--from NAME] [--re ID] [--now]
-  orca-bus inbox [--unread] [--as NAME] [--json]
+  orca-bus inbox [--unread] [--as NAME] [--json] [--follow]
   orca-bus ack <id> [--as NAME]
   orca-bus who [--json]
   orca-bus status [ID]
@@ -71,6 +72,8 @@ def main(argv=None, root=None, default_reply_cmd=None):
     r.add_argument('name'); r.add_argument('--handle'); r.add_argument('--kind', choices=['claude', 'codex', 'shell'])
     r.add_argument('--session'); r.add_argument('--note')
     r.add_argument('--owner', help='who is alerted when this tab cannot take messages (a registered name)')
+    r.add_argument('--mode', choices=['typed', 'inbox'],
+                   help='typed (default): the daemon types messages in. inbox: never typed; watch `inbox --follow`')
     u = sub.add_parser('unregister'); u.add_argument('name')
     s = sub.add_parser('send', help='send one line (<= max_len chars) to a registered name')
     s.add_argument('to'); s.add_argument('text'); s.add_argument('--from', dest='frm'); s.add_argument('--re', dest='reply_to')
@@ -78,6 +81,9 @@ def main(argv=None, root=None, default_reply_cmd=None):
                    help='try one delivery right here (same lock and checks as the daemon); if it cannot, the daemon keeps it')
     i = sub.add_parser('inbox'); i.add_argument('--unread', action='store_true'); i.add_argument('--as', dest='me')
     i.add_argument('--json', action='store_true'); i.add_argument('--all', action='store_true', help='every message on the bus')
+    i.add_argument('--follow', action='store_true',
+                   help='print each new message to you as one line, forever (run it under a Monitor); with --unread, '
+                        'print the unread ones first')
     a = sub.add_parser('ack'); a.add_argument('ids', nargs='+'); a.add_argument('--as', dest='me')
     w = sub.add_parser('who'); w.add_argument('--json', action='store_true')
     st = sub.add_parser('status'); st.add_argument('id', nargs='?'); st.add_argument('--json', action='store_true')
@@ -109,9 +115,10 @@ def main(argv=None, root=None, default_reply_cmd=None):
                 terms = live_terminals() or {}
                 agent = (terms.get(handle) or {}).get('agent')
                 kind = agent if agent in ('claude', 'codex') else 'shell'
-            old = bus.register(args.name, handle, kind, args.session, args.note, args.owner)
+            old = bus.register(args.name, handle, kind, args.session, args.note, args.owner, args.mode)
             moved = f' (was {old.get("handle")})' if old and old.get('handle') != handle else ''
-            print(f'registered {args.name} -> {handle} [{kind}]{moved}')
+            mode = bus.registry()[args.name]['mode']
+            print(f'registered {args.name} -> {handle} [{kind}, {mode}]{moved}')
         elif args.cmd == 'unregister':
             print('removed' if bus.unregister(args.name) else 'not registered')
         elif args.cmd == 'send':
@@ -126,6 +133,14 @@ def main(argv=None, root=None, default_reply_cmd=None):
                     bus.messages()[m['id']], bus.registry().get(args.to), orca.terminals())
                 m = bus.messages()[m['id']]
                 print(f'{m["id"]} {m["state"]}: {m["history"][-1][2]}')
+        elif args.cmd == 'inbox' and args.follow:
+            me = whoami(bus, args.me)
+            cmd = bus.config().get('reply_cmd', 'orca-bus')
+            if args.unread:
+                for m in bus.inbox(me, unread=True):
+                    print(f'[bus {m["id"]} from {m["from"]}] {m["text"]} || reply: {cmd} send {m["from"]} --re {m["id"]} "..."', flush=True)
+            for m in bus.follow(me):
+                print(f'[bus {m["id"]} from {m["from"]}] {m["text"]} || reply: {cmd} send {m["from"]} --re {m["id"]} "..."', flush=True)
         elif args.cmd == 'inbox':
             if args.all:
                 ms = sorted(bus.messages().values(), key=lambda m: m['time'])

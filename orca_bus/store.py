@@ -20,6 +20,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 KINDS = ('claude', 'codex', 'shell')
+# typed: the daemon types messages into the tab. inbox: never typed; the tab watches `inbox --follow` itself
+MODES = ('typed', 'inbox')
 # states: queued -> (delivered | inbox | failed); retry is queued with an attempt count; acked is set by the recipient
 OPEN_STATES = ('queued', 'retry')
 NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
@@ -155,10 +157,12 @@ class Bus:
         tmp.write_text(json.dumps(reg, indent=1, sort_keys=True), encoding='utf-8')
         os.replace(tmp, self.reg_path)
 
-    def register(self, name, handle=None, kind='shell', session=None, note=None, owner=None):
+    def register(self, name, handle=None, kind='shell', session=None, note=None, owner=None, mode=None):
         check_name(name)
         if kind not in KINDS:
             raise BusError(f'kind must be one of {KINDS}')
+        if mode not in (None,) + MODES:
+            raise BusError(f'mode must be one of {MODES}')
         with self.lock():
             reg = self.registry()
             old = reg.get(name)
@@ -166,8 +170,9 @@ class Bus:
                 check_name(owner)
             elif old:
                 owner = old.get('owner')  # a restarted tab re-registering its name keeps the name's owner
+            mode = mode or (old or {}).get('mode') or 'typed'
             reg[name] = {'handle': handle, 'kind': kind, 'session': session, 'note': note, 'owner': owner,
-                         'updated': now_iso()}
+                         'mode': mode, 'updated': now_iso()}
             self._save_registry(reg)
             self._append({'ev': 'register', 'name': name, 'handle': handle, 'kind': kind, 'session': session,
                           'previous_handle': old and old.get('handle'), 'time': now_iso()})
@@ -256,6 +261,30 @@ class Bus:
         if unread:
             out = [m for m in out if m['state'] not in ('acked',)]
         return sorted(out, key=lambda m: m['time'])
+
+    def follow(self, name, from_start=False, poll=2.0, sleep=time.sleep, stop=None):
+        """Yield each message addressed to `name` as it arrives (tails inbox/<name>.jsonl; cheap to poll)."""
+        path = self.root / 'inbox' / f'{check_name(name)}.jsonl'
+        pos = 0 if from_start or not path.exists() else path.stat().st_size
+        buf = b''
+        while not (stop and stop()):
+            try:
+                with open(path, 'rb') as f:
+                    f.seek(pos)
+                    chunk = f.read()
+            except FileNotFoundError:
+                chunk = b''
+            pos += len(chunk)
+            buf += chunk
+            *lines, buf = buf.split(b'\n')
+            for line in lines:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get('ev') == 'msg':
+                    yield ev
+            sleep(poll)
 
     def ack(self, name, mid):
         m = self.messages().get(mid)
